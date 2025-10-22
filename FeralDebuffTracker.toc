@@ -1,0 +1,13 @@
+## Interface: 11200
+## Title: Feral Debuff Tracker
+## Notes: Tracks Rake, Rip, Pounce Bleed, and Faerie Fire (Feral)
+## Author: You
+## Version: 2.6
+## DefaultState: enabled
+## LoadOnDemand: 0
+
+FeralDebuffTracker.xml
+Core.lua
+UI.lua
+DebuffLogic.lua
+Events.lua
