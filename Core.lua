@@ -2,7 +2,7 @@ local _, class = UnitClass("player")
 if class ~= "DRUID" then return end
 
 FeralDebuffTracker = {}
-FeralDebuffTracker.DEBUG_DEBUFF_CACHE = true
+FeralDebuffTracker.DEBUG_DEBUFF_CACHE = false
 local addon = FeralDebuffTracker
 addon.frame = getglobal("FeralDebuffTrackerFrame")
 addon.activeDebuffs = {}
@@ -275,14 +275,7 @@ SlashCmdList["FERALDEBUFFTRACKER"] = function(msg)
         -- Dump recent rip tick history and any pending calibration for current target
         local key = addon.currentTargetKey or ((type(UnitName) == "function" and UnitName("target")) or "(unknown)")
         DEFAULT_CHAT_FRAME:AddMessage("FDT: riphist for key=" .. tostring(key))
-        if addon._pendingCalibration and addon._pendingCalibration[key] then
-            local p = addon._pendingCalibration[key]
-            local cnt = 0; if p and p.samples then for _ in pairs(p.samples) do cnt = cnt + 1 end end
-            DEFAULT_CHAT_FRAME:AddMessage("  pending calibration combo=" .. tostring(p.combo) ..
-                " samples=" .. tostring(cnt))
-        else
-            DEFAULT_CHAT_FRAME:AddMessage("  no pending calibration for this key")
-        end
+        DEFAULT_CHAT_FRAME:AddMessage("  no pending calibration (calibration removed)")
         if addon._ripTickHistory and addon._ripTickHistory[key] then
             local hist = addon._ripTickHistory[key]
             local i = 0

@@ -47,16 +47,6 @@ function addon:GetPlayerAP()
     return 0
 end
 
-function addon:GetAPFactor()
-    FeralDebuffTrackerDB = FeralDebuffTrackerDB or {}
-    return tonumber(FeralDebuffTrackerDB.apFactor) or 0
-end
-
-function addon:SetAPFactor(v)
-    FeralDebuffTrackerDB = FeralDebuffTrackerDB or {}
-    FeralDebuffTrackerDB.apFactor = tonumber(v) or 0
-end
-
 -- Return expected tick, adjusted total, and ticks for a given Rip combo
 function addon:ExpectedRipTickForCombo(combo)
     local totals = { 225, 438, 707, 1032, 1413 }
@@ -72,36 +62,6 @@ function addon:ExpectedRipTickForCombo(combo)
     local adjustedTotal = baseTotal + (apFactor * ap)
     local expectedTick = adjustedTotal / ticks
     return expectedTick, adjustedTotal, ticks
-end
-
--- Calibrate apFactor from observed tick samples for a known combo
-function addon:CalibrateAPFactor(combo, observedTicks)
-    if not observedTicks or type(observedTicks) ~= "table" then return nil, "no samples" end
-    local count = 0; local sum = 0
-    for _, v in ipairs(observedTicks) do
-        if type(v) == "number" and v > 0 then
-            sum = sum + v; count = count + 1
-        end
-    end
-    if count == 0 then return nil, "no numeric samples" end
-    local avgTick = sum / count
-    local duration = 12
-    if self.GetDebuffDuration and type(self.GetDebuffDuration) == "function" then
-        local ok, d = pcall(function() return self:GetDebuffDuration("Rip", combo) end)
-        if ok and type(d) == "number" then duration = d end
-    end
-    local ticks = math.max(1, math.floor((duration / 2) + 0.5))
-    local observedTotal = avgTick * ticks
-    local totals = { 225, 438, 707, 1032, 1413 }
-    local baseTotal = totals[combo] or totals[5]
-    local ap = self:GetPlayerAP()
-    if not ap or ap == 0 then return nil, "AP unknown or zero (cannot calibrate)" end
-    local rawFactor = (observedTotal - baseTotal) / ap
-    local alpha = 0.25
-    local old = self:GetAPFactor() or 0
-    local newFactor = (alpha * rawFactor) + ((1 - alpha) * old)
-    self:SetAPFactor(newFactor)
-    return newFactor, { raw = rawFactor, smoothed = newFactor, ap = ap, observedTotal = observedTotal, base = baseTotal }
 end
 
 function addon:ResetIcons()
@@ -123,6 +83,66 @@ function addon:ResetIcons()
     end
     local activeDebuffs = addon.activeDebuffs
     if activeDebuffs then for k in pairs(activeDebuffs) do activeDebuffs[k] = nil end end
+end
+
+-- Helper: determine whether a spell (id or name) is one of our tracked debuffs
+function addon:IsTrackedDebuff(spellIdOrName)
+    if not spellIdOrName then return false end
+    local name = nil
+    if type(spellIdOrName) == "number" and type(GetSpellInfo) == "function" then
+        name = GetSpellInfo(spellIdOrName)
+    end
+    if not name and type(spellIdOrName) == "string" then name = spellIdOrName end
+    if not name then return false end
+    -- Simple English-based matching (consistent with other code in the addon)
+    if string.find(name, "Rake", 1, true) then return true end
+    if string.find(name, "Rip", 1, true) then return true end
+    if string.find(name, "Pounce", 1, true) then return true end
+    if string.find(name, "Faerie Fire", 1, true) then return true end
+    return false
+end
+
+-- Update debuff info from UNIT_AURA data (spellId or spell name). This is a best-effort
+-- mapping to our canonical debuff names and will create/refresh the activeDebuffs entry.
+function addon:UpdateDebuff(spellIdOrName, duration, expirationTime)
+    if not spellIdOrName then return end
+    local name = nil
+    if type(spellIdOrName) == "number" and type(GetSpellInfo) == "function" then
+        name = GetSpellInfo(spellIdOrName)
+    end
+    if not name and type(spellIdOrName) == "string" then name = spellIdOrName end
+    if not name then return end
+
+    local canonical = nil
+    if string.find(name, "Rake", 1, true) then
+        canonical = "Rake"
+    elseif string.find(name, "Rip", 1, true) then
+        canonical = "Rip"
+    elseif string.find(name, "Pounce", 1, true) then
+        canonical = "Pounce Bleed"
+    elseif string.find(name, "Faerie Fire", 1, true) then
+        canonical = "Faerie Fire (Feral)"
+    end
+    if not canonical then return end
+
+    local texKey = (canonical == "Pounce Bleed") and "Pounce" or
+        (canonical == "Faerie Fire (Feral)" and "FF" or canonical)
+    local tex = self.iconPaths and self.iconPaths[texKey]
+
+    self.activeDebuffs = self.activeDebuffs or {}
+    local now = GetTime()
+    local dur = duration or (self.GetDebuffDuration and self:GetDebuffDuration(canonical)) or 12
+    local expireAt = expirationTime or (now + dur)
+
+    self.activeDebuffs[canonical] = {
+        expire = expireAt,
+        texture = tex,
+        comboPoints = (self.activeDebuffs[canonical] and self.activeDebuffs[canonical].comboPoints) or 0,
+        appliedInCombat = false,
+        appliedAt = (expireAt - dur),
+        caster = "player"
+    }
+    pcall(function() self:RefreshIcons() end)
 end
 
 function addon:RemoveDebuff(name)
@@ -158,19 +178,7 @@ function addon:RemoveDebuff(name)
             local uName = UnitName("target")
             if uName then table.insert(keysToClear, uName) end
         end
-        if addon._pendingCalibration then
-            for _, k in ipairs(keysToClear) do
-                if k and addon._pendingCalibration[k] then addon._pendingCalibration[k] = nil end
-            end
-            -- Also remove any pending entries whose key contains the target name as substring
-            if addon.currentTargetName then
-                for pk, _ in pairs(addon._pendingCalibration) do
-                    if type(pk) == "string" and string.find(pk, addon.currentTargetName, 1, true) then
-                        addon._pendingCalibration[pk] = nil
-                    end
-                end
-            end
-        end
+        -- No pending calibration stored; nothing to clear here.
         -- clear rip tick history for these keys as well to avoid cross-application inference
         if addon._ripTickHistory then
             for _, k in ipairs(keysToClear) do

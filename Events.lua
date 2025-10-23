@@ -42,40 +42,7 @@ function addon:_RecordRipTick(key, dmg)
     -- write back
     self._ripTickHistory[key] = hist
     -- suppressed stored history dump to reduce spam
-    -- If there's a pending calibration for this target, append sample and calibrate when enough samples
-    if self._pendingCalibration and self._pendingCalibration[key] then
-        local p = self._pendingCalibration[key]
-        p.samples = p.samples or {}
-        table.insert(p.samples, dmg)
-        -- per-sample addition suppressed; calibration result will be shown when ready
-        local sampleCount = 0
-        for _ in pairs(p.samples) do sampleCount = sampleCount + 1 end
-        -- Calibrate as soon as we have one sample so future inference uses it.
-        if sampleCount >= 1 and type(self.CalibrateAPFactor) == "function" then
-            local ok, info = pcall(function() return self:CalibrateAPFactor(p.combo, p.samples) end)
-            if ok then
-                if self.DEBUG_DEBUFF_CACHE then
-                    -- `info` may be a number (newFactor) or a table with fields; guard access
-                    local out = nil
-                    if type(info) == "table" and info.smoothed then
-                        out = info.smoothed
-                    elseif type(info) == "number" then
-                        out =
-                            info
-                    else
-                        out = tostring(info)
-                    end
-                    DEFAULT_CHAT_FRAME:AddMessage("FDT: CalibrateAPFactor result=" .. tostring(out))
-                end
-            else
-                if self.DEBUG_DEBUFF_CACHE then
-                    DEFAULT_CHAT_FRAME:AddMessage("FDT: CalibrateAPFactor failed: " .. tostring(info))
-                end
-            end
-            -- clear pending calibration after attempt
-            self._pendingCalibration[key] = nil
-        end
-    end
+    -- No calibration/sample collection in one-shot inference mode
 end
 
 -- Infer Rip combo from recent tick history. Returns combo or nil, and error metric.
@@ -233,34 +200,7 @@ frame:SetScript("OnEvent", function()
                         "FDT: Rip registered! CHAT_MSG_SPELL_PERIODIC_CREATURE_DAMAGE")
                 end
                 addon:RegisterDebuff("Rip")
-                -- start pending calibration for AP factor if we can determine combo
-                local reportedCombo = 0
-                if type(GetComboPoints) == "function" then reportedCombo = GetComboPoints("player", "target") or 0 end
-                if not reportedCombo or reportedCombo == 0 then
-                    reportedCombo = addon.lastNonZeroComboPoints or
-                        addon.lastKnownComboPoints or 0
-                end
-                if reportedCombo and reportedCombo > 0 then
-                    local key = (type(addon.ComputeTargetKey) == "function" and addon:ComputeTargetKey("target"))
-                        or (type(UnitGUID) == "function" and UnitGUID("target")) or UnitName("target")
-                    local plainName = (type(UnitName) == "function" and UnitExists("target") and UnitName("target")) or
-                        nil
-                    local guid = (type(UnitGUID) == "function" and UnitExists("target") and UnitGUID("target")) or nil
-                    addon._pendingCalibration = addon._pendingCalibration or {}
-                    -- store pending calibration under multiple keys to make sure
-                    -- tick parsing can find it regardless of which key is used.
-                    addon._pendingCalibration[key] = { combo = reportedCombo, samples = {} }
-                    if plainName and not addon._pendingCalibration[plainName] then
-                        addon._pendingCalibration[plainName] = { combo = reportedCombo, samples = {} }
-                    end
-                    if guid and not addon._pendingCalibration[guid] then
-                        addon._pendingCalibration[guid] = { combo = reportedCombo, samples = {} }
-                    end
-                    if addon.DEBUG_DEBUFF_CACHE then
-                        DEFAULT_CHAT_FRAME:AddMessage("FDT: pending calibration for key=" ..
-                            tostring(key) .. " combo=" .. tostring(reportedCombo))
-                    end
-                end
+                -- simple flow: infer directly from ticks; no pending calibration
             elseif string.find(msg, " is afflicted by Pounce", 1, true) then
                 addon:RegisterDebuff("Pounce Bleed")
             elseif string.find(msg, " is afflicted by Faerie Fire", 1, true) then
@@ -369,31 +309,57 @@ frame:SetScript("OnEvent", function()
                     addon._ripTickHistory[key] = newHist
                     hist = newHist
                     histCount = 1
-                    -- If we had a pending calibration for this target, clear it now
-                    -- because a new application has been observed and inference
-                    -- should be allowed to apply immediately.
-                    if addon._pendingCalibration then
-                        -- clear by exact key
-                        addon._pendingCalibration[key] = nil
-                        -- clear by plain name 'who' if present
-                        if who and addon._pendingCalibration[who] then addon._pendingCalibration[who] = nil end
-                        -- also clear any pending entries that contain the current target name or the 'who' substring
-                        for pk, _ in pairs(addon._pendingCalibration) do
-                            if type(pk) == "string" then
-                                if addon.currentTargetName and string.find(pk, addon.currentTargetName, 1, true) then
-                                    addon._pendingCalibration[pk] = nil
-                                elseif who and string.find(pk, who, 1, true) then
-                                    addon._pendingCalibration[pk] = nil
+                end
+                local combo, err = addon:_InferRipComboFromHistory(key)
+                -- If no combo inferred but there's no active Rip (it faded), try a
+                -- single-tick inference using the most recent tick so a lone
+                -- tick after fade still creates a visible icon.
+                if not combo then
+                    local activeRip = addon.activeDebuffs and addon.activeDebuffs["Rip"]
+                    local now = GetTime()
+                    local ripExpired = true
+                    if activeRip and activeRip.expire and activeRip.expire > now then ripExpired = false end
+                    if (not activeRip) or ripExpired then
+                        -- Use the most recent tick in hist
+                        local cur_tick = nil
+                        if hist and histCount >= 1 then cur_tick = hist[histCount] and hist[histCount].dmg end
+                        if cur_tick then
+                            local totals = { 225, 438, 707, 1032, 1413 }
+                            local bestC, bestE = nil, 1e9
+                            local ap = (type(addon.GetPlayerAP) == "function" and addon:GetPlayerAP()) or 0
+                            local apFactor = (type(addon.GetAPFactor) == "function" and addon:GetAPFactor()) or 0
+                            for c = 1, 5 do
+                                local expectedTick = nil
+                                if type(addon.ExpectedRipTickForCombo) == "function" then
+                                    local ok, v = pcall(function() return addon:ExpectedRipTickForCombo(c) end)
+                                    if ok and v then
+                                        if type(v) == "table" then expectedTick = v[1] end
+                                        if type(v) == "number" then expectedTick = v end
+                                    end
+                                end
+                                if not expectedTick then
+                                    local total = totals[c]
+                                    local duration = (addon.GetDebuffDuration and addon:GetDebuffDuration("Rip", c)) or
+                                        12
+                                    local ticks = math.max(1, math.floor((duration / 2) + 0.5))
+                                    local adjustedTotal = (total or 0) + (apFactor * (ap or 0))
+                                    expectedTick = adjustedTotal / ticks
+                                end
+                                if expectedTick and expectedTick > 0 then
+                                    local e = math.abs(cur_tick - expectedTick) / expectedTick
+                                    if e < bestE then bestE, bestC = e, c end
                                 end
                             end
-                        end
-                        if addon.DEBUG_DEBUFF_CACHE then
-                            DEFAULT_CHAT_FRAME:AddMessage("FDT: Cleared pending calibration for key=" ..
-                                tostring(key) .. " (also removed substring matches)")
+                            if bestC and bestE and bestE < 0.25 then
+                                -- Adjust for observed +1 bias
+                                local adj = bestC - 1
+                                if adj < 1 then adj = 1 end
+                                combo = adj
+                                err = bestE
+                            end
                         end
                     end
                 end
-                local combo, err = addon:_InferRipComboFromHistory(key)
                 -- If damageChanged, compute best combo from the single current tick
                 -- so we can immediately update the icon and expire.
                 local forcedCombo = nil
@@ -416,7 +382,7 @@ frame:SetScript("OnEvent", function()
                         end
                         if not expectedTick then
                             local total = totals[c]
-                            local duration = (addon.GetDebuffDuration and addon:GetDebuffDuration("Rip", c)) or 10
+                            local duration = (addon.GetDebuffDuration and addon:GetDebuffDuration("Rip", c)) or 12
                             local ticks = duration / 2
                             expectedTick = total / ticks
                         end
@@ -444,44 +410,7 @@ frame:SetScript("OnEvent", function()
                     histCount = 0
                     if hist then for _ in pairs(hist) do histCount = histCount + 1 end end
 
-                    -- If there's a pending calibration for this target and it hasn't
-                    -- collected enough samples yet, prefer the reported combo and do
-                    -- not allow inference to override/refresh expire until calibration
-                    -- completes. This prevents a newly-applied 1-CP Rip from being
-                    -- misclassified as 2-CP just because the player's AP increases tick.
-                    -- Look up any pending calibration for this target. The pending key
-                    -- may be a computed key (name|level... ) while the tick parsing may
-                    -- only produce the plain name. Try multiple fallbacks.
-                    local pending = nil
-                    if addon._pendingCalibration then
-                        pending = addon._pendingCalibration[key] or (who and addon._pendingCalibration[who])
-                        if not pending then
-                            for pk, pv in pairs(addon._pendingCalibration) do
-                                if type(pk) == "string" and type(who) == "string" and string.find(pk, who, 1, true) then
-                                    pending = pv; break
-                                end
-                            end
-                        end
-                    end
-                    local pendingSampleCount = 0
-                    if pending and pending.samples then
-                        for _ in pairs(pending.samples) do
-                            pendingSampleCount =
-                                pendingSampleCount + 1
-                        end
-                    end
-                    local suppressedByPending = false
-                    -- Do not let pending calibration suppress inference when a damage
-                    -- change (new application) was observed - we want immediate update.
-                    if (not damageChanged) and pending and (pendingSampleCount < 3) and pending.combo and pending.combo > 0 then
-                        suppressedByPending = true
-                        if addon.DEBUG_DEBUFF_CACHE then
-                            DEFAULT_CHAT_FRAME:AddMessage(
-                                "FDT: Suppressing inferred combo while pending calibration; using reported combo=" ..
-                                tostring(pending.combo))
-                        end
-                        combo = pending.combo
-                    end
+                    -- No pending calibration flow; inference applies immediately.
 
                     local now = GetTime()
                     local dur = addon.GetDebuffDuration and addon:GetDebuffDuration("Rip", combo) or 10
@@ -510,20 +439,7 @@ frame:SetScript("OnEvent", function()
                             prev.expire = now + remainingDur
                             prev.appliedAt = now - elapsed
                             prev.caster = "player"
-                            -- Clear any pending calibration for this target since we've
-                            -- just treated the inference as a reapplication.
-                            if addon._pendingCalibration then
-                                addon._pendingCalibration[key] = nil
-                                if who and addon._pendingCalibration[who] then addon._pendingCalibration[who] = nil end
-                                -- also clear any pending entries that contain the name
-                                if addon.currentTargetName then
-                                    for pk, _ in pairs(addon._pendingCalibration) do
-                                        if type(pk) == "string" and string.find(pk, addon.currentTargetName, 1, true) then
-                                            addon._pendingCalibration[pk] = nil
-                                        end
-                                    end
-                                end
-                            end
+                            -- No pending calibration to clear in one-shot inference flow.
                         else
                             prev.expire = prev.expire or (now + remainingDur)
                         end
